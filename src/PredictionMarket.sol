@@ -20,7 +20,9 @@ interface IMarketFactory {
 /// - Staking is one-way: no unstake, no early exit (parimutuel v1 design).
 /// - Locking is time-derived, never a transaction.
 /// - The 3% fee is charged on the losing pool only — a winner never receives
-///   less than their own stake back.
+///   less than their own stake back. The fee splits between the prediction's
+///   creator (`creatorFeeBps`, snapshotted at creation) and Somoco's treasury,
+///   and is auto-distributed at resolution (best-effort; `sweepFee()` retries).
 /// - Resolution with an empty side (no losers, or no winners) voids the market
 ///   and refunds everyone fee-free.
 /// - If the resolver goes silent, anyone can void after a 30-day timeout.
@@ -80,15 +82,32 @@ contract PredictionMarket is ReentrancyGuard {
     /// @notice Minimum stake per call, snapshotted from the factory at creation.
     uint256 public minStake;
 
+    /// @notice The prediction's creator — earns `creatorFeeBps` of the losing
+    /// pool when the market resolves (their reward for making the market).
+    address public creator;
+
+    /// @notice Creator's slice of the fee in bps, snapshotted from the factory
+    /// at creation. Always <= FEE_BPS; the remainder goes to the treasury.
+    uint16 public creatorFeeBps;
+
     Outcome public outcome;
     bool public voided;
     bool public feeSwept;
+    bool public creatorFeeSettled;
 
     uint256 public poolYes;
     uint256 public poolNo;
 
-    /// @notice Fee owed to the treasury, fixed at resolution.
+    /// @notice Total fee taken from the losing pool, fixed at resolution.
+    /// Used by payout math; split into creator + treasury slices below.
     uint256 public feeAmount;
+
+    /// @notice Creator's slice of `feeAmount`, fixed at resolution.
+    uint256 public creatorFeeAmount;
+
+    /// @notice Treasury's slice; grows by the creator's slice if the creator's
+    /// receiver reverts (a reverting creator forfeits to the treasury).
+    uint256 public treasuryFeeAmount;
 
     mapping(address => uint256) public stakeYes;
     mapping(address => uint256) public stakeNo;
@@ -100,6 +119,8 @@ contract PredictionMarket is ReentrancyGuard {
     event Resolved(Outcome outcome, uint256 poolYes, uint256 poolNo, uint256 fee);
     event Voided(uint256 poolYes, uint256 poolNo);
     event Claimed(address indexed user, uint256 amount);
+    event CreatorFeePaid(address indexed creator, uint256 amount);
+    event CreatorFeeForfeited(address indexed creator, uint256 amount);
     event FeeSwept(address indexed treasury, uint256 amount);
     event DustSwept(address indexed treasury, uint256 amount);
 
@@ -130,13 +151,22 @@ contract PredictionMarket is ReentrancyGuard {
     }
 
     /// @notice Called exactly once by the factory right after cloning.
-    function initialize(bytes32 termId_, uint64 resolutionDate_, uint64 lockAt_, uint256 minStake_) external {
+    function initialize(
+        bytes32 termId_,
+        uint64 resolutionDate_,
+        uint64 lockAt_,
+        uint256 minStake_,
+        address creator_,
+        uint16 creatorFeeBps_
+    ) external {
         if (factory != address(0)) revert AlreadyInitialized();
         factory = msg.sender;
         termId = termId_;
         resolutionDate = resolutionDate_;
         lockAt = lockAt_;
         minStake = minStake_;
+        creator = creator_;
+        creatorFeeBps = creatorFeeBps_;
     }
 
     // ---------------------------------------------------------------- views
@@ -179,7 +209,9 @@ contract PredictionMarket is ReentrancyGuard {
     /// @notice Declare the outcome. Resolver only, and only once Locked (§7).
     /// @dev If either pool is empty there are no losers (or no winners) — the
     /// market voids instead so everyone is refunded fee-free (§8).
-    function resolve(Outcome outcome_) external {
+    /// Fees are auto-distributed here, best-effort: a failed transfer never
+    /// blocks resolution and can be retried via `sweepFee()`.
+    function resolve(Outcome outcome_) external nonReentrant {
         if (msg.sender != IMarketFactory(factory).resolver()) revert NotResolver();
         if (state() != State.Locked) revert NotLocked();
         if (outcome_ == Outcome.Unresolved) revert InvalidOutcome();
@@ -193,7 +225,35 @@ contract PredictionMarket is ReentrancyGuard {
         finalizedAt = uint64(block.timestamp);
         uint256 losingPool = outcome_ == Outcome.Yes ? poolNo : poolYes;
         feeAmount = (losingPool * FEE_BPS) / BPS_DENOMINATOR;
+        creatorFeeAmount = (losingPool * creatorFeeBps) / BPS_DENOMINATOR;
+        treasuryFeeAmount = feeAmount - creatorFeeAmount;
         emit Resolved(outcome_, poolYes, poolNo, feeAmount);
+
+        _distributeFees();
+    }
+
+    /// @dev Pay the creator and treasury their fee slices. Best-effort by
+    /// design: a reverting creator forfeits their slice to the treasury; a
+    /// reverting treasury leaves `feeSwept` false so `sweepFee()` can retry.
+    function _distributeFees() internal {
+        if (creatorFeeAmount > 0 && !creatorFeeSettled) {
+            creatorFeeSettled = true;
+            (bool ok,) = creator.call{value: creatorFeeAmount}("");
+            if (ok) {
+                emit CreatorFeePaid(creator, creatorFeeAmount);
+            } else {
+                treasuryFeeAmount += creatorFeeAmount;
+                emit CreatorFeeForfeited(creator, creatorFeeAmount);
+            }
+        }
+        if (treasuryFeeAmount > 0 && !feeSwept) {
+            address treasury = IMarketFactory(factory).treasury();
+            (bool ok,) = treasury.call{value: treasuryFeeAmount}("");
+            if (ok) {
+                feeSwept = true;
+                emit FeeSwept(treasury, treasuryFeeAmount);
+            }
+        }
     }
 
     /// @notice Void the market (outcome impossible/ambiguous). Resolver only.
@@ -259,15 +319,14 @@ contract PredictionMarket is ReentrancyGuard {
 
     // ------------------------------------------------------------- sweeping
 
-    /// @notice Send the fixed fee to the treasury. Callable by anyone, once,
-    /// only after a real resolution (a voided market earns Somoco nothing, §8).
+    /// @notice Retry fee distribution if the automatic attempt at resolution
+    /// failed (e.g. the treasury reverted). Callable by anyone, only after a
+    /// real resolution (a voided market earns nobody anything, §8).
     function sweepFee() external nonReentrant {
         if (outcome == Outcome.Unresolved) revert NotResolved();
-        if (feeSwept || feeAmount == 0) revert NothingToSweep();
-        feeSwept = true;
-        address treasury = IMarketFactory(factory).treasury();
-        _pay(treasury, feeAmount);
-        emit FeeSwept(treasury, feeAmount);
+        bool pending = (creatorFeeAmount > 0 && !creatorFeeSettled) || (treasuryFeeAmount > 0 && !feeSwept);
+        if (!pending) revert NothingToSweep();
+        _distributeFees();
     }
 
     /// @notice After the market has been final for `DUST_GRACE`, sweep whatever
@@ -277,9 +336,10 @@ contract PredictionMarket is ReentrancyGuard {
         if (block.timestamp < uint256(finalizedAt) + DUST_GRACE) revert GraceNotOver();
 
         uint256 balance = address(this).balance;
-        // An unswept fee is part of the remaining balance; account for it so
-        // sweepFee can't double-pay afterwards.
-        if (!feeSwept && feeAmount > 0) feeSwept = true;
+        // Unswept fee slices are part of the remaining balance; mark them
+        // settled so sweepFee can't double-pay afterwards.
+        feeSwept = true;
+        creatorFeeSettled = true;
         if (balance == 0) revert NothingToSweep();
 
         address treasury = IMarketFactory(factory).treasury();

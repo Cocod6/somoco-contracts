@@ -34,6 +34,12 @@ contract MarketFactory is Ownable2Step {
     /// @notice Minimum stake snapshotted into each market at creation (§10 #3).
     uint256 public minStake;
 
+    /// @notice The market creator's slice of the 3% fee, in bps, snapshotted
+    /// into each market at creation. Starts at 50 (0.5% of the losing pool —
+    /// so the treasury nets 2.5%); adjustable as Somoco grows, capped at the
+    /// total fee.
+    uint16 public creatorFeeBps;
+
     /// @notice One market per Intuition Triple id (§3).
     mapping(bytes32 => address) public marketForTerm;
     address[] private _markets;
@@ -45,6 +51,7 @@ contract MarketFactory is Ownable2Step {
     event ResolverChanged(address indexed previous, address indexed current);
     event TreasuryChanged(address indexed previous, address indexed current);
     event MinStakeChanged(uint256 previous, uint256 current);
+    event CreatorFeeBpsChanged(uint16 previous, uint16 current);
 
     // --------------------------------------------------------------- errors
 
@@ -55,6 +62,7 @@ contract MarketFactory is Ownable2Step {
     error InvalidLockOffset();
     error NotResolver();
     error NotPendingResolver();
+    error CreatorFeeTooHigh();
 
     // ---------------------------------------------------------------- setup
 
@@ -63,6 +71,7 @@ contract MarketFactory is Ownable2Step {
         resolver = resolver_;
         treasury = treasury_;
         minStake = minStake_;
+        creatorFeeBps = 50; // 0.5% of the losing pool to the market creator
         // The implementation's constructor marks itself initialized, so it can
         // never be hijacked directly (§11).
         implementation = address(new PredictionMarket());
@@ -76,12 +85,15 @@ contract MarketFactory is Ownable2Step {
     /// @param termId Intuition Triple id (bytes32 — never cast through uint).
     /// @param resolutionDate Unix seconds when the outcome is knowable.
     /// @param lockOffset Seconds before `resolutionDate` that staking closes.
-    function createMarket(bytes32 termId, uint64 resolutionDate, uint64 lockOffset)
+    /// @param creator The prediction's author — earns `creatorFeeBps` of the
+    /// losing pool at resolution.
+    function createMarket(bytes32 termId, uint64 resolutionDate, uint64 lockOffset, address creator)
         external
         onlyOwner
         returns (address market)
     {
         if (termId == bytes32(0)) revert InvalidTermId();
+        if (creator == address(0)) revert ZeroAddress();
         if (marketForTerm[termId] != address(0)) revert DuplicateMarket();
         if (resolutionDate <= block.timestamp) revert ResolutionInPast();
         if (lockOffset >= resolutionDate) revert InvalidLockOffset();
@@ -90,7 +102,7 @@ contract MarketFactory is Ownable2Step {
         if (lockAt <= block.timestamp) revert InvalidLockOffset();
 
         market = Clones.clone(implementation);
-        PredictionMarket(market).initialize(termId, resolutionDate, lockAt, minStake);
+        PredictionMarket(market).initialize(termId, resolutionDate, lockAt, minStake, creator, creatorFeeBps);
 
         marketForTerm[termId] = market;
         _markets.push(market);
@@ -139,5 +151,14 @@ contract MarketFactory is Ownable2Step {
     function setMinStake(uint256 newMinStake) external onlyOwner {
         emit MinStakeChanged(minStake, newMinStake);
         minStake = newMinStake;
+    }
+
+    /// @notice Adjust the creator's slice of the fee (e.g. reduce it as the
+    /// platform grows). Capped at the total fee so the treasury share can
+    /// never go negative. Applies to markets created after this call only.
+    function setCreatorFeeBps(uint16 newCreatorFeeBps) external onlyOwner {
+        if (newCreatorFeeBps > PredictionMarket(implementation).FEE_BPS()) revert CreatorFeeTooHigh();
+        emit CreatorFeeBpsChanged(creatorFeeBps, newCreatorFeeBps);
+        creatorFeeBps = newCreatorFeeBps;
     }
 }

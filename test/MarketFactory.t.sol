@@ -13,6 +13,7 @@ contract MarketFactoryTest is Test {
     address resolver = makeAddr("resolver");
     address treasury = makeAddr("treasury");
     address rando = makeAddr("rando");
+    address predCreator = makeAddr("predCreator");
 
     bytes32 constant TERM_A = bytes32(uint256(0xaaaa));
     bytes32 constant TERM_B = bytes32(uint256(0xbbbb));
@@ -30,7 +31,7 @@ contract MarketFactoryTest is Test {
 
     function test_CreateMarketRegistersAndInitializes() public {
         vm.prank(owner);
-        address market = factory.createMarket(TERM_A, resolutionDate, 24 hours);
+        address market = factory.createMarket(TERM_A, resolutionDate, 24 hours, predCreator);
 
         assertEq(factory.marketForTerm(TERM_A), market);
         assertEq(factory.marketCount(), 1);
@@ -45,40 +46,40 @@ contract MarketFactoryTest is Test {
     function test_RevertWhen_CreateByNonOwner() public {
         vm.prank(rando);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, rando));
-        factory.createMarket(TERM_A, resolutionDate, 24 hours);
+        factory.createMarket(TERM_A, resolutionDate, 24 hours, predCreator);
     }
 
     function test_RevertWhen_DuplicateTermId() public {
         vm.startPrank(owner);
-        factory.createMarket(TERM_A, resolutionDate, 24 hours);
+        factory.createMarket(TERM_A, resolutionDate, 24 hours, predCreator);
         vm.expectRevert(MarketFactory.DuplicateMarket.selector);
-        factory.createMarket(TERM_A, resolutionDate, 24 hours);
+        factory.createMarket(TERM_A, resolutionDate, 24 hours, predCreator);
         vm.stopPrank();
     }
 
     function test_RevertWhen_ZeroTermId() public {
         vm.prank(owner);
         vm.expectRevert(MarketFactory.InvalidTermId.selector);
-        factory.createMarket(bytes32(0), resolutionDate, 24 hours);
+        factory.createMarket(bytes32(0), resolutionDate, 24 hours, predCreator);
     }
 
     function test_RevertWhen_ResolutionInPast() public {
         vm.prank(owner);
         vm.expectRevert(MarketFactory.ResolutionInPast.selector);
-        factory.createMarket(TERM_A, uint64(block.timestamp), 0);
+        factory.createMarket(TERM_A, uint64(block.timestamp), 0, predCreator);
     }
 
     function test_RevertWhen_LockAlreadyPassed() public {
         // resolution is tomorrow but the lock offset puts lockAt in the past
         vm.prank(owner);
         vm.expectRevert(MarketFactory.InvalidLockOffset.selector);
-        factory.createMarket(TERM_A, uint64(block.timestamp + 1 days), 2 days);
+        factory.createMarket(TERM_A, uint64(block.timestamp + 1 days), 2 days, predCreator);
     }
 
     function test_TwoMarketsIndependentState() public {
         vm.startPrank(owner);
-        address a = factory.createMarket(TERM_A, resolutionDate, 24 hours);
-        address b = factory.createMarket(TERM_B, resolutionDate, 24 hours);
+        address a = factory.createMarket(TERM_A, resolutionDate, 24 hours, predCreator);
+        address b = factory.createMarket(TERM_B, resolutionDate, 24 hours, predCreator);
         vm.stopPrank();
         assertTrue(a != b);
 
@@ -155,11 +156,42 @@ contract MarketFactoryTest is Test {
         factory.proposeResolver(address(0));
     }
 
+    function test_RevertWhen_ZeroCreator() public {
+        vm.prank(owner);
+        vm.expectRevert(MarketFactory.ZeroAddress.selector);
+        factory.createMarket(TERM_A, resolutionDate, 24 hours, address(0));
+    }
+
+    function test_CreatorFeeBpsDefaultAndSnapshot() public {
+        assertEq(factory.creatorFeeBps(), 50); // 0.5% default
+
+        vm.startPrank(owner);
+        address a = factory.createMarket(TERM_A, resolutionDate, 24 hours, predCreator);
+        factory.setCreatorFeeBps(25); // platform grew — creator share reduced
+        address b = factory.createMarket(TERM_B, resolutionDate, 24 hours, predCreator);
+        vm.stopPrank();
+
+        // existing market keeps its snapshot; new market gets the new value
+        assertEq(PredictionMarket(a).creatorFeeBps(), 50);
+        assertEq(PredictionMarket(b).creatorFeeBps(), 25);
+        assertEq(PredictionMarket(a).creator(), predCreator);
+    }
+
+    function test_RevertWhen_CreatorFeeAboveTotalFee() public {
+        vm.prank(owner);
+        vm.expectRevert(MarketFactory.CreatorFeeTooHigh.selector);
+        factory.setCreatorFeeBps(301); // total fee is 300 bps
+
+        vm.prank(rando);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, rando));
+        factory.setCreatorFeeBps(25);
+    }
+
     function test_MinStakeSnapshotPerMarket() public {
         vm.startPrank(owner);
-        address a = factory.createMarket(TERM_A, resolutionDate, 24 hours);
+        address a = factory.createMarket(TERM_A, resolutionDate, 24 hours, predCreator);
         factory.setMinStake(1 ether);
-        address b = factory.createMarket(TERM_B, resolutionDate, 24 hours);
+        address b = factory.createMarket(TERM_B, resolutionDate, 24 hours, predCreator);
         vm.stopPrank();
 
         // existing market keeps its snapshot; new market gets the new value

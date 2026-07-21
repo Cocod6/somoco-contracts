@@ -31,6 +31,9 @@ contract ReentrantClaimer {
     }
 }
 
+/// @dev A contract with no receive/fallback — any plain transfer to it reverts.
+contract NoReceive {}
+
 /// @dev Receiver that rejects funds, to exercise TransferFailed.
 contract RejectingReceiver {
     PredictionMarket public market;
@@ -60,6 +63,7 @@ contract PredictionMarketTest is Test {
     address bob = makeAddr("bob");
     address carol = makeAddr("carol");
     address rando = makeAddr("rando");
+    address predCreator = makeAddr("predCreator");
 
     bytes32 constant TERM_ID = bytes32(uint256(0xbeef));
     uint256 constant MIN_STAKE = 0.01 ether;
@@ -76,7 +80,7 @@ contract PredictionMarketTest is Test {
         lockAt = resolutionDate - LOCK_OFFSET;
 
         vm.prank(owner);
-        market = PredictionMarket(factory.createMarket(TERM_ID, resolutionDate, LOCK_OFFSET));
+        market = PredictionMarket(factory.createMarket(TERM_ID, resolutionDate, LOCK_OFFSET, predCreator));
 
         vm.deal(alice, 1000 ether);
         vm.deal(bob, 1000 ether);
@@ -114,13 +118,13 @@ contract PredictionMarketTest is Test {
 
     function test_RevertWhen_InitializeCalledTwice() public {
         vm.expectRevert(PredictionMarket.AlreadyInitialized.selector);
-        market.initialize(TERM_ID, resolutionDate, lockAt, MIN_STAKE);
+        market.initialize(TERM_ID, resolutionDate, lockAt, MIN_STAKE, predCreator, 50);
     }
 
     function test_RevertWhen_InitializeImplementation() public {
         PredictionMarket impl = PredictionMarket(factory.implementation());
         vm.expectRevert(PredictionMarket.AlreadyInitialized.selector);
-        impl.initialize(TERM_ID, resolutionDate, lockAt, MIN_STAKE);
+        impl.initialize(TERM_ID, resolutionDate, lockAt, MIN_STAKE, predCreator, 50);
     }
 
     // -------------------------------------------------------------- staking
@@ -226,6 +230,8 @@ contract PredictionMarketTest is Test {
     /// The exact worked example from the spec:
     /// poolYes = 100, poolNo = 100, YES wins, alice staked 10 on YES.
     /// fee = 3, distributed = 97, alice's payout = 10 + 10*97/100 = 19.7.
+    /// The 3 fee splits 0.5% creator / 2.5% treasury and auto-distributes
+    /// at resolution.
     function test_WorkedExampleFromSpec() public {
         _stake(alice, PredictionMarket.Side.Yes, 10 ether);
         _stake(bob, PredictionMarket.Side.Yes, 90 ether);
@@ -233,6 +239,10 @@ contract PredictionMarketTest is Test {
 
         _resolve(PredictionMarket.Outcome.Yes);
         assertEq(market.feeAmount(), 3 ether);
+
+        // Fee auto-distributed at resolve: creator 0.5% of 100, treasury the rest.
+        assertEq(predCreator.balance, 0.5 ether);
+        assertEq(treasury.balance, 2.5 ether);
 
         assertEq(market.claimableOf(alice), 19.7 ether);
         assertEq(market.claimableOf(bob), 177.3 ether);
@@ -246,9 +256,7 @@ contract PredictionMarketTest is Test {
         vm.prank(bob);
         market.claim();
 
-        // 19.7 + 177.3 + 3 = 200: everything accounted for, zero dust here.
-        market.sweepFee();
-        assertEq(treasury.balance, 3 ether);
+        // 19.7 + 177.3 + 0.5 + 2.5 = 200: everything accounted for, zero dust.
         assertEq(address(market).balance, 0);
     }
 
@@ -467,16 +475,64 @@ contract PredictionMarketTest is Test {
 
     // ------------------------------------------------------------- sweeping
 
-    function test_SweepFeeOnceOnly() public {
+    function test_FeesAutoDistributedAtResolve() public {
         _stake(alice, PredictionMarket.Side.Yes, 10 ether);
         _stake(bob, PredictionMarket.Side.No, 10 ether);
         _resolve(PredictionMarket.Outcome.Yes);
 
-        market.sweepFee();
-        assertEq(treasury.balance, 0.3 ether);
+        // losing pool 10 -> fee 0.3: creator 0.05 (0.5%), treasury 0.25 (2.5%)
+        assertEq(predCreator.balance, 0.05 ether);
+        assertEq(treasury.balance, 0.25 ether);
+        assertTrue(market.feeSwept());
+        assertTrue(market.creatorFeeSettled());
 
+        // nothing left to sweep — auto-distribution already happened
         vm.expectRevert(PredictionMarket.NothingToSweep.selector);
         market.sweepFee();
+    }
+
+    function test_RevertingCreatorForfeitsToTreasury() public {
+        // A creator that can't receive native token forfeits its slice.
+        address badCreator = address(new NoReceive());
+        bytes32 term2 = bytes32(uint256(0xbeef2));
+        vm.prank(owner);
+        PredictionMarket m2 = PredictionMarket(factory.createMarket(term2, resolutionDate, LOCK_OFFSET, badCreator));
+
+        vm.prank(alice);
+        m2.stake{value: 10 ether}(PredictionMarket.Side.Yes);
+        vm.prank(bob);
+        m2.stake{value: 10 ether}(PredictionMarket.Side.No);
+
+        vm.warp(lockAt);
+        vm.prank(resolver);
+        m2.resolve(PredictionMarket.Outcome.Yes);
+
+        // creator slice (0.05) folded into treasury: 0.25 + 0.05 = 0.3
+        assertEq(badCreator.balance, 0);
+        assertEq(treasury.balance, 0.3 ether);
+        assertTrue(m2.feeSwept());
+    }
+
+    function test_RevertingTreasuryRetriedViaSweepFee() public {
+        // Treasury that can't receive: auto-distribution pays the creator but
+        // leaves the treasury slice pending; resolution itself is NOT blocked.
+        address badTreasury = address(new NoReceive());
+        vm.prank(owner);
+        factory.setTreasury(badTreasury);
+
+        _stake(alice, PredictionMarket.Side.Yes, 10 ether);
+        _stake(bob, PredictionMarket.Side.No, 10 ether);
+        _resolve(PredictionMarket.Outcome.Yes);
+
+        assertEq(predCreator.balance, 0.05 ether); // creator still paid
+        assertFalse(market.feeSwept());            // treasury slice pending
+
+        // Fix the treasury, retry permissionlessly.
+        vm.prank(owner);
+        factory.setTreasury(treasury);
+        market.sweepFee();
+        assertEq(treasury.balance, 0.25 ether);
+        assertTrue(market.feeSwept());
     }
 
     function test_RevertWhen_SweepFeeOnVoided() public {
@@ -491,20 +547,19 @@ contract PredictionMarketTest is Test {
         _stake(alice, PredictionMarket.Side.Yes, 10 ether);
         _stake(bob, PredictionMarket.Side.No, 10 ether);
         _resolve(PredictionMarket.Outcome.Yes);
-
-        vm.prank(alice);
-        market.claim(); // bob (loser) never claims; fee never swept
+        // fee (0.3) auto-distributed at resolve; alice never claims her 19.7
 
         vm.expectRevert(PredictionMarket.GraceNotOver.selector);
         market.sweepDust();
 
         vm.warp(uint256(market.finalizedAt()) + market.DUST_GRACE());
+        uint256 treasuryBefore = treasury.balance;
         uint256 remaining = address(market).balance;
+        assertEq(remaining, 19.7 ether); // the unclaimed payout
         market.sweepDust();
-        assertEq(treasury.balance, remaining);
+        assertEq(treasury.balance - treasuryBefore, remaining);
         assertEq(address(market).balance, 0);
 
-        // fee is folded into the dust sweep; sweepFee can't double-pay
         vm.expectRevert(PredictionMarket.NothingToSweep.selector);
         market.sweepFee();
     }
@@ -535,12 +590,20 @@ contract PredictionMarketTest is Test {
             assertEq(uint8(market.state()), uint8(PredictionMarket.State.Voided));
         }
 
-        // Sum of every claimable + fee must be covered by the balance.
+        // Fees (both slices) auto-distribute at resolve, so the remaining
+        // balance must cover exactly the sum of outstanding claims.
         uint256 totalClaims;
         for (uint256 i; i < 8; i++) {
             totalClaims += market.claimableOf(users[i]);
         }
-        assertLe(totalClaims + market.feeAmount(), address(market).balance, "insolvent");
+        assertLe(totalClaims, address(market).balance, "insolvent");
+
+        // On a real resolution the fee splits must be fully settled.
+        if (uint8(market.state()) == uint8(PredictionMarket.State.Resolved)) {
+            assertTrue(market.creatorFeeSettled() || market.creatorFeeAmount() == 0);
+            assertTrue(market.feeSwept() || market.feeAmount() == 0);
+            assertEq(predCreator.balance, market.creatorFeeAmount());
+        }
 
         // Every non-zero claim succeeds; claimed sum matches predictions.
         for (uint256 i; i < 8; i++) {
@@ -552,9 +615,6 @@ contract PredictionMarketTest is Test {
             assertEq(users[i].balance - before, expect);
         }
 
-        if (market.feeAmount() > 0 && uint8(market.state()) == uint8(PredictionMarket.State.Resolved)) {
-            market.sweepFee();
-        }
         // Whatever is left is pure rounding dust: strictly less than 8 wei
         // (at most 1 wei lost per winner's truncated division).
         assertLt(address(market).balance, 8, "too much dust left");
