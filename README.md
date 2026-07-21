@@ -1,66 +1,36 @@
-## Foundry
+# Somoco Settlement Contracts (v1)
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+Parimutuel YES/NO settlement for Somoco predictions, in native `$TRUST` on
+Intuition (chain id 1155). Full spec: [`../docs/settlement-v1-spec.md`](../docs/settlement-v1-spec.md).
 
-Foundry consists of:
+## Contracts
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+| Contract | Purpose |
+|---|---|
+| `src/MarketFactory.sol` | Deploys/tracks markets as EIP-1167 clones. Holds the `owner` / `resolver` / `treasury` roles and `minStake` config. |
+| `src/PredictionMarket.sol` | One clone per prediction. Stake → time-lock → resolve/void → claim. 3% fee on the losing pool only. |
 
-## Documentation
+## Commands
 
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
+```bash
+forge build          # compile
+forge test           # 48 tests incl. fuzzed solvency invariant
+forge test -vvv      # verbose on failure
 ```
 
-### Test
+## Deploy
 
-```shell
-$ forge test
+Set `OWNER`, `RESOLVER`, `TREASURY` (multisigs!), `MIN_STAKE` (wei), then:
+
+```bash
+forge script script/Deploy.s.sol --rpc-url <rpc> --broadcast
 ```
 
-### Format
+## Status
 
-```shell
-$ forge fmt
-```
-
-### Gas Snapshots
-
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+- [x] Contracts + full §11 test suite (2026-07-21)
+- [ ] Deploy to Intuition testnet, run with play amounts
+- [ ] Multisig setup for owner / resolver / treasury
+- [ ] Audit before holding real money
+- [ ] Legal review (§10 #6) — **before launch**
+- [ ] App integration: `createMarket` on approval, `stake` on detail view, `resolve` in admin flow, `claim` in My Predictions
