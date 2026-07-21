@@ -16,6 +16,15 @@
 
 RPC: `https://rpc.intuition.systems`
 
+### Markets created (2026-07-21)
+
+| Prediction (termId prefix) | Market | Locks |
+|---|---|---|
+| coco GOAT (`0x117349…`) | `0x01e3153adc7ae00e2bbd6c353a39b38e04023b73` | 2026-12-30 |
+| saturn (`0xd95926…`) | `0x573246b826226d4bba4c568bf9b2a42b0508994c` | 2026-12-30 |
+| solstice rug (`0x00f286…`) | `0x626fca2cde3f34b49370cea604e971c0725615a6` | 2026-12-27 |
+| samsung — FAST TEST (`0x6c63d5…`) | `0x83dCCCB6A83874773B893a1e2B277E8d4F254008` | ~1h after creation (full-cycle test) |
+
 ### Create a market (owner CLI)
 
 ```bash
