@@ -304,11 +304,13 @@ contract PredictionMarketTest is Test {
 
     // ------------------------------------------- one-sided / empty markets
 
-    function test_ResolveWithEmptyLosingPoolVoids() public {
+    function test_ResolveWithEmptyLosingPoolRefundsWinners() public {
+        // Only the winning side has stakers: NOT a void. Winners get their
+        // stake back via the normal payout, with zero fee (empty losing pool).
         _stake(alice, PredictionMarket.Side.Yes, 10 ether);
-        _resolve(PredictionMarket.Outcome.Yes); // no NO stakers -> void
+        _resolve(PredictionMarket.Outcome.Yes); // no NO stakers
 
-        assertEq(uint8(market.state()), uint8(PredictionMarket.State.Voided));
+        assertEq(uint8(market.state()), uint8(PredictionMarket.State.Resolved));
         assertEq(market.claimableOf(alice), 10 ether);
         assertEq(market.feeAmount(), 0); // fee-free
 
@@ -328,6 +330,110 @@ contract PredictionMarketTest is Test {
     function test_ResolveEmptyMarketVoids() public {
         _resolve(PredictionMarket.Outcome.Yes);
         assertEq(uint8(market.state()), uint8(PredictionMarket.State.Voided));
+    }
+
+    // ---------------------------------------------------- early unstake (§6)
+
+    function test_UnstakeReturns60PercentAndEmits() public {
+        _stake(alice, PredictionMarket.Side.Yes, 10 ether);
+        assertEq(market.poolYes(), 10 ether);
+
+        uint256 before = alice.balance;
+        vm.expectEmit(true, false, false, true);
+        emit PredictionMarket.Unstaked(alice, PredictionMarket.Side.Yes, 10 ether, 6 ether, 4 ether);
+        vm.prank(alice);
+        market.unstake(PredictionMarket.Side.Yes);
+
+        assertEq(alice.balance - before, 6 ether); // keeps 60%
+        assertEq(market.stakeYes(alice), 0);
+        assertEq(market.poolYes(), 0);
+        assertEq(market.forfeitPool(), 4 ether); // 40% stays in the pot
+        // invariant: balance == poolYes + poolNo + forfeitPool
+        assertEq(address(market).balance, market.poolYes() + market.poolNo() + market.forfeitPool());
+    }
+
+    function test_ForfeitBoostsTheWinningSide() public {
+        // Alice & Bob on YES, Carol on NO. Alice bails, forfeiting 4.
+        _stake(alice, PredictionMarket.Side.Yes, 10 ether);
+        _stake(bob, PredictionMarket.Side.Yes, 10 ether);
+        _stake(carol, PredictionMarket.Side.No, 20 ether);
+
+        vm.prank(alice);
+        market.unstake(PredictionMarket.Side.Yes); // forfeit 4 -> forfeitPool
+        assertEq(market.forfeitPool(), 4 ether);
+        assertEq(market.poolYes(), 10 ether); // only Bob left on YES
+
+        _resolve(PredictionMarket.Outcome.Yes);
+        // losingPool 20, fee 0.6, distributed = (20 - 0.6) + 4 = 23.4
+        // Bob (sole YES winner) = 10 + 10*23.4/10 = 33.4
+        assertEq(market.claimableOf(bob), 33.4 ether);
+        assertEq(market.claimableOf(alice), 0); // she left
+        assertEq(market.claimableOf(carol), 0); // lost
+
+        uint256 before = bob.balance;
+        vm.prank(bob);
+        market.claim();
+        assertEq(bob.balance - before, 33.4 ether);
+        assertEq(address(market).balance, 0); // fully settled
+    }
+
+    function test_UnstakeBothSidesIndependently() public {
+        _stake(alice, PredictionMarket.Side.Yes, 10 ether);
+        _stake(alice, PredictionMarket.Side.No, 5 ether);
+
+        vm.prank(alice);
+        market.unstake(PredictionMarket.Side.Yes);
+        assertEq(market.stakeYes(alice), 0);
+        assertEq(market.stakeNo(alice), 5 ether); // NO position untouched
+        assertEq(market.forfeitPool(), 4 ether);
+
+        vm.prank(alice);
+        market.unstake(PredictionMarket.Side.No);
+        assertEq(market.stakeNo(alice), 0);
+        assertEq(market.forfeitPool(), 4 ether + 2 ether);
+    }
+
+    function test_RevertWhen_UnstakeAfterLock() public {
+        _stake(alice, PredictionMarket.Side.Yes, 10 ether);
+        _lock();
+        vm.prank(alice);
+        vm.expectRevert(PredictionMarket.StakingClosed.selector);
+        market.unstake(PredictionMarket.Side.Yes);
+    }
+
+    function test_RevertWhen_UnstakeNothing() public {
+        vm.prank(rando);
+        vm.expectRevert(PredictionMarket.NothingStaked.selector);
+        market.unstake(PredictionMarket.Side.Yes);
+    }
+
+    function test_UnstakeThenRestakeWorks() public {
+        _stake(alice, PredictionMarket.Side.Yes, 10 ether);
+        vm.prank(alice);
+        market.unstake(PredictionMarket.Side.Yes);
+        // can stake again after exiting
+        _stake(alice, PredictionMarket.Side.Yes, 5 ether);
+        assertEq(market.stakeYes(alice), 5 ether);
+        assertEq(market.poolYes(), 5 ether);
+    }
+
+    function test_AllWinnersUnstakeThenResolveVoids() public {
+        // Both YES stakers bail; YES then wins with no one left -> void.
+        _stake(alice, PredictionMarket.Side.Yes, 10 ether);
+        _stake(bob, PredictionMarket.Side.Yes, 10 ether);
+        _stake(carol, PredictionMarket.Side.No, 20 ether);
+
+        vm.prank(alice);
+        market.unstake(PredictionMarket.Side.Yes);
+        vm.prank(bob);
+        market.unstake(PredictionMarket.Side.Yes);
+        assertEq(market.poolYes(), 0);
+
+        _resolve(PredictionMarket.Outcome.Yes); // winningPool empty -> void
+        assertEq(uint8(market.state()), uint8(PredictionMarket.State.Voided));
+        assertEq(market.claimableOf(carol), 20 ether); // refunded
+        // forfeit pot (8) has no rightful winner; stays for the dust sweep
+        assertEq(market.forfeitPool(), 8 ether);
     }
 
     // ------------------------------------------------------ void & timeout
@@ -568,25 +674,44 @@ contract PredictionMarketTest is Test {
 
     /// §11: sum of all outstanding claims + unswept fee never exceeds balance,
     /// and every claim actually succeeds (nobody's payout reverts for
-    /// insufficient funds) across arbitrary stake sequences.
-    function test_SolvencyInvariant_Fuzz(uint96[8] memory amounts, bool[8] memory sides, bool yesWins) public {
+    /// insufficient funds) across arbitrary stake AND unstake sequences.
+    function test_SolvencyInvariant_Fuzz(
+        uint96[8] memory amounts,
+        bool[8] memory sides,
+        bool[8] memory bails,
+        bool yesWins
+    ) public {
         address[8] memory users;
-        bool anyYes;
-        bool anyNo;
         for (uint256 i; i < 8; i++) {
             users[i] = address(uint160(0x5000 + i));
             vm.deal(users[i], 600 ether);
             uint256 amt = bound(uint256(amounts[i]), MIN_STAKE, 500 ether);
             PredictionMarket.Side side = sides[i] ? PredictionMarket.Side.Yes : PredictionMarket.Side.No;
             _stake(users[i], side, amt);
-            if (sides[i]) anyYes = true;
-            else anyNo = true;
+        }
+
+        // Some users bail early (40% penalty) before the market locks.
+        for (uint256 i; i < 8; i++) {
+            if (!bails[i]) continue;
+            PredictionMarket.Side side = sides[i] ? PredictionMarket.Side.Yes : PredictionMarket.Side.No;
+            vm.prank(users[i]);
+            market.unstake(side);
+        }
+
+        // Invariant holds continuously: balance == poolYes + poolNo + forfeitPool
+        assertEq(address(market).balance, market.poolYes() + market.poolNo() + market.forfeitPool(), "pre-resolve");
+
+        uint256 winners; // count remaining stakers on the winning side
+        for (uint256 i; i < 8; i++) {
+            bool onWinningSide = (sides[i] == yesWins);
+            uint256 remaining = yesWins ? market.stakeYes(users[i]) : market.stakeNo(users[i]);
+            if (onWinningSide && remaining > 0) winners++;
         }
 
         _resolve(yesWins ? PredictionMarket.Outcome.Yes : PredictionMarket.Outcome.No);
 
-        if (!(anyYes && anyNo)) {
-            // one-sided -> voided; refunds must be exact
+        if (winners == 0) {
+            // no one left on the winning side -> voided
             assertEq(uint8(market.state()), uint8(PredictionMarket.State.Voided));
         }
 
@@ -615,9 +740,15 @@ contract PredictionMarketTest is Test {
             assertEq(users[i].balance - before, expect);
         }
 
-        // Whatever is left is pure rounding dust: strictly less than 8 wei
-        // (at most 1 wei lost per winner's truncated division).
-        assertLt(address(market).balance, 8, "too much dust left");
+        if (uint8(market.state()) == uint8(PredictionMarket.State.Voided)) {
+            // Void refunds every active stake exactly; the forfeit pot has no
+            // rightful winner and is left in the contract for the dust sweep.
+            assertEq(address(market).balance, market.forfeitPool(), "void residual != forfeit pot");
+        } else {
+            // Resolved: forfeit pot was distributed to winners, so only
+            // rounding dust remains (< 1 wei per winner's truncated division).
+            assertLt(address(market).balance, 8, "too much dust left");
+        }
     }
 
     // -------------------------------------------------------- misc guards

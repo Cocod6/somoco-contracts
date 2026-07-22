@@ -61,6 +61,12 @@ contract PredictionMarket is ReentrancyGuard {
     /// funds may be swept to the treasury (§5, Rounding).
     uint256 public constant DUST_GRACE = 180 days;
 
+    /// @notice Early-exit penalty, in bps. A user who unstakes before the
+    /// market locks keeps `(1 - UNSTAKE_PENALTY)` of their stake; the forfeited
+    /// remainder stays in the pool and is split among the winning side at
+    /// resolution (rewards conviction). 4000 = 40%.
+    uint256 public constant UNSTAKE_PENALTY_BPS = 4000;
+
     // -------------------------------------------------------------- storage
 
     /// @notice The factory that deployed and initialized this clone.
@@ -109,6 +115,11 @@ contract PredictionMarket is ReentrancyGuard {
     /// receiver reverts (a reverting creator forfeits to the treasury).
     uint256 public treasuryFeeAmount;
 
+    /// @notice Total forfeited by early unstakers (both sides). Added to the
+    /// winning side's distributable pot at resolution. On a void it has no
+    /// rightful winner and is left in the contract for the dust sweep.
+    uint256 public forfeitPool;
+
     mapping(address => uint256) public stakeYes;
     mapping(address => uint256) public stakeNo;
     mapping(address => bool) public claimed;
@@ -116,6 +127,7 @@ contract PredictionMarket is ReentrancyGuard {
     // --------------------------------------------------------------- events
 
     event Staked(address indexed user, Side side, uint256 amount);
+    event Unstaked(address indexed user, Side side, uint256 staked, uint256 refunded, uint256 forfeited);
     event Resolved(Outcome outcome, uint256 poolYes, uint256 poolNo, uint256 fee);
     event Voided(uint256 poolYes, uint256 poolNo);
     event Claimed(address indexed user, uint256 amount);
@@ -137,6 +149,7 @@ contract PredictionMarket is ReentrancyGuard {
     error NotClaimable();
     error AlreadyClaimed();
     error NothingToClaim();
+    error NothingStaked();
     error NotResolved();
     error NothingToSweep();
     error GraceNotOver();
@@ -188,8 +201,9 @@ contract PredictionMarket is ReentrancyGuard {
 
     // -------------------------------------------------------------- staking
 
-    /// @notice Stake native $TRUST on a side. One-way: no unstake in v1 (§6).
-    /// Staking both sides is allowed; repeat stakes accumulate.
+    /// @notice Stake native $TRUST on a side. Staking both sides is allowed;
+    /// repeat stakes accumulate. Positions can be exited early via `unstake`
+    /// while the market is Open, at the `UNSTAKE_PENALTY_BPS` cost.
     function stake(Side side) external payable {
         if (state() != State.Open) revert StakingClosed();
         if (msg.value < minStake) revert BelowMinStake();
@@ -204,19 +218,51 @@ contract PredictionMarket is ReentrancyGuard {
         emit Staked(msg.sender, side, msg.value);
     }
 
+    /// @notice Exit a position early, before the market locks. Returns the
+    /// whole of one side's stake minus the `UNSTAKE_PENALTY_BPS` penalty; the
+    /// forfeited portion stays in the pool and boosts the winning side at
+    /// resolution. Full-position exit per side (unstake YES and NO separately).
+    function unstake(Side side) external nonReentrant {
+        if (state() != State.Open) revert StakingClosed();
+
+        uint256 staked = side == Side.Yes ? stakeYes[msg.sender] : stakeNo[msg.sender];
+        if (staked == 0) revert NothingStaked();
+
+        uint256 forfeit = (staked * UNSTAKE_PENALTY_BPS) / BPS_DENOMINATOR;
+        uint256 refund = staked - forfeit;
+
+        // Effects: clear the position, shrink the pool by the amount returned,
+        // and keep the forfeit as un-owned pool value. The balance invariant
+        // `balance == poolYes + poolNo + forfeitPool` is preserved.
+        if (side == Side.Yes) {
+            stakeYes[msg.sender] = 0;
+            poolYes -= staked;
+        } else {
+            stakeNo[msg.sender] = 0;
+            poolNo -= staked;
+        }
+        forfeitPool += forfeit;
+
+        _pay(msg.sender, refund);
+        emit Unstaked(msg.sender, side, staked, refund, forfeit);
+    }
+
     // ----------------------------------------------------------- resolution
 
     /// @notice Declare the outcome. Resolver only, and only once Locked (§7).
-    /// @dev If either pool is empty there are no losers (or no winners) — the
-    /// market voids instead so everyone is refunded fee-free (§8).
-    /// Fees are auto-distributed here, best-effort: a failed transfer never
-    /// blocks resolution and can be retried via `sweepFee()`.
+    /// @dev Voids only when the WINNING side has no stakers (no rightful winner)
+    /// — that also covers the empty-market case (§8). A one-sided market where
+    /// only the winning side has stakers is NOT voided: those winners get their
+    /// stake back (plus any forfeit pot) via the normal payout, with zero fee
+    /// on an empty losing pool. Fees are auto-distributed here, best-effort:
+    /// a failed transfer never blocks resolution and can be retried via `sweepFee()`.
     function resolve(Outcome outcome_) external nonReentrant {
         if (msg.sender != IMarketFactory(factory).resolver()) revert NotResolver();
         if (state() != State.Locked) revert NotLocked();
         if (outcome_ == Outcome.Unresolved) revert InvalidOutcome();
 
-        if (poolYes == 0 || poolNo == 0) {
+        uint256 winningPool = outcome_ == Outcome.Yes ? poolYes : poolNo;
+        if (winningPool == 0) {
             _void();
             return;
         }
@@ -298,9 +344,11 @@ contract PredictionMarket is ReentrancyGuard {
         emit Claimed(msg.sender, amount);
     }
 
-    /// @dev Payout math per §5. Voided → exact refund of both sides, no fee.
-    /// Resolved → own winning stake back + pro-rata share of the losing pool
-    /// net of fee, via full-precision mulDiv to minimise rounding dust.
+    /// @dev Payout math per §5. Voided → exact refund of both sides, no fee
+    /// (the forfeit pot has no rightful winner and is left for the dust sweep).
+    /// Resolved → own winning stake back + pro-rata share of (the losing pool
+    /// net of fee) plus the early-exit forfeit pot, via full-precision mulDiv
+    /// to minimise rounding dust.
     function _payoutOf(address user) internal view returns (uint256) {
         if (voided) {
             return stakeYes[user] + stakeNo[user];
@@ -312,7 +360,7 @@ contract PredictionMarket is ReentrancyGuard {
 
         uint256 winningPool = outcome == Outcome.Yes ? poolYes : poolNo;
         uint256 losingPool = outcome == Outcome.Yes ? poolNo : poolYes;
-        uint256 distributed = losingPool - feeAmount;
+        uint256 distributed = (losingPool - feeAmount) + forfeitPool;
 
         return winStake + Math.mulDiv(winStake, distributed, winningPool);
     }

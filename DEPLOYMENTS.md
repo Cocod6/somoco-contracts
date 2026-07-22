@@ -1,24 +1,42 @@
 # Deployments
 
-## Intuition mainnet (chain 1155) — v1.1 TEST deployment, 2026-07-22
+## Intuition mainnet (chain 1155) — v1.2 TEST deployment, 2026-07-22
 
-> v1.1: 3% fee now splits — `creatorFeeBps` (0.5% default) to the prediction's
-> creator, remainder to the treasury — and auto-distributes at resolution.
-> `createMarket` gained a `creator` param. Still single-EOA roles: redeploy
-> with multisigs (after audit + legal review) before real users stake real money.
+> v1.2 adds **early-exit unstake**: `unstake(Side)` lets a user withdraw a full
+> position before lock, keeping 60% (`UNSTAKE_PENALTY_BPS = 4000`); the
+> forfeited 40% stays in the pool (`forfeitPool`) and boosts the winning side at
+> resolution. Void condition changed to "winning side empty" (a one-sided market
+> where only winners staked now pays them their stake back instead of voiding).
+> 60 tests green incl. fuzzed solvency across stake+unstake. Still single-EOA
+> roles: redeploy with multisigs (after audit + legal review) before real money.
+
+| What | Address |
+|---|---|
+| `MarketFactory` v1.2 | `0xCF1893f255DD8d197f3415411658329d432DaC84` |
+| `PredictionMarket` implementation v1.2 | `0xa811De948921A5EC3D8ab607445f65008af66EaC` |
+| Owner | deployed by `0x665e...82C5`, ownership transferred to Coco's burner `0x45E4...D64b` (pending acceptance via the Approve page's activate button) |
+| Resolver / Treasury | `0x45E4300Ff44a1360494e233eB7E9dcC2F8DaD64b` — Coco's burner |
+| Min stake | `0.01 TRUST` · creator fee 50 bps · exit penalty 4000 bps (40%) |
+
+4 markets recreated on v1.2 (creator = burner): Messi Ballon d'Or (note: created
+with resolution 2026-10-31, DB says 10-26 — harmless date typo on a test market),
+coco GOAT, saturn/100-people, solstice rug. v1.1 `0xB8aA...3364` retired with 0.2
+TRUST of test stakes still in it (reclaimable: resolve on the old factory + claim).
+
+---
+
+## v1.1 (retired 2026-07-22)
+
+> v1.1: 3% fee splits — `creatorFeeBps` (0.5% default) to the creator,
+> remainder to the treasury — auto-distributed at resolution. `createMarket`
+> gained a `creator` param. Superseded by v1.2 (early-exit unstake) above.
 
 | What | Address |
 |---|---|
 | `MarketFactory` v1.1 | `0xB8aAEF799ddA3d514Dc493eEC0Cf3B7989E13364` |
-| `PredictionMarket` implementation v1.1 | `0x16AF15104cFEb9a563b5e492195F2544D7A91fa6` |
-| Owner | deployed by `0x665e...82C5`, ownership transferred to Coco's burner `0x45E4...D64b` (pending acceptance via the Approve page's activate button) |
-| Resolver / Treasury | `0x45E4300Ff44a1360494e233eB7E9dcC2F8DaD64b` — Coco's burner |
-| Min stake | `0.01 TRUST` · creator fee 50 bps |
+| `PredictionMarket` impl v1.1 | `0x16AF15104cFEb9a563b5e492195F2544D7A91fa6` |
 
-Markets recreated on v1.1 (same 3 December predictions, creator = burner).
-The v1.0 factory `0x6B8481401648f540fe87B6173d80E37D6B501313` is retired —
-its only settled market (samsung test) paid out fully; the 3 empty December
-markets on it are abandoned.
+Holds 0.2 TRUST of test stakes (reclaimable: resolve on this factory + claim).
 
 ---
 
