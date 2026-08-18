@@ -74,3 +74,50 @@ cast send 0x6B8481401648f540fe87B6173d80E37D6B501313 \
   "createMarket(bytes32,uint64,uint64)" <termId> <resolutionDateUnix> <lockOffsetSecs> \
   --rpc-url https://rpc.intuition.systems --account intuition
 ```
+
+---
+
+## Friend-market TEST stack — 2026-08-11 (throwaway, mainnet)
+
+Deployed so PvP / friend markets could be exercised end to end **without putting
+the new resolver contract on the live factory's path**. The live factory
+`0xCF1893f255DD8d197f3415411658329d432DaC84` and the 21 markets on it — including
+real user stakes — were not touched by any of this.
+
+| Role | Address |
+|---|---|
+| MarketFactory (test) | `0x727563925677C71252A2105120199C8E0E8d407E` |
+| PredictionMarket impl | `0x37915c886aa021076B95523E813d97cd52da2c56` |
+| **FriendJury** | `0xDC5034F108521E65454dF89aD157ab9a9692Ad29` |
+| Factory owner | `0x45E4…D64b` (Coco's burner — so the app UI can create markets and register juries) |
+| Factory resolver | **the FriendJury contract** |
+| Treasury | `0x45E4…D64b` |
+| Min stake | `0.01 TRUST` (1e16 wei) |
+
+Deployed from the `intuition` keystore (`0x665e…82C5`); total gas well under
+0.001 TRUST. The resolver handover used the real two-step procedure, so this
+doubles as a rehearsal of the live one:
+
+```bash
+cast send <FACTORY> "proposeResolver(address)" <JURY> --account intuition   # from the resolver
+cast send <JURY>    "acceptResolverRole()"              --account intuition   # anyone
+```
+
+The app points at this stack via `NEXT_PUBLIC_SETTLEMENT_FACTORY` +
+`NEXT_PUBLIC_FRIEND_JURY` in `.env.local` (local only — never set these in
+Vercel for the test stack). Comment both out to return to the live factory.
+
+### Fast-test market (bypasses the UI's midnight-UTC resolution date)
+
+```bash
+# resolution ~20 min out, staking closes 5 min before that
+NOW=$(date +%s); RES=$((NOW + 1200))
+cast send 0x727563925677C71252A2105120199C8E0E8d407E \
+  "createMarket(bytes32,uint64,uint64,address)" <termId> $RES 300 <creator> \
+  --rpc-url https://rpc.intuition.systems --account intuition
+
+# then register the jury (owner-only — from Coco's burner, or via the Approve page)
+cast send 0xDC5034F108521E65454dF89aD157ab9a9692Ad29 \
+  "registerJury(address,address[],address,uint64)" <market> "[<voter1>,<voter2>]" <judge> 3600 \
+  --rpc-url https://rpc.intuition.systems --account <owner>
+```
